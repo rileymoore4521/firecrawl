@@ -5,6 +5,7 @@ import {
   advanceMonitorAfterSkippedCheck,
   claimDueMonitors,
   createMonitorCheck,
+  deferMonitorClaim,
   dispatchScheduledMonitorCheck,
   getMonitorCheck,
   updateMonitorCheck,
@@ -12,16 +13,31 @@ import {
 } from "./store";
 import { autumnService } from "../autumn/autumn.service";
 import { isMonitorCheckStale, MONITOR_CHECK_STALE_ERROR } from "./stale";
+import { validateMonitorCron } from "./cron";
+import { monitorJitterOffsetMs } from "./jitter";
 import type { MonitorRow } from "./types";
 
 const logger = _logger.child({ module: "monitoring-scheduler" });
+
+// Search monitors route to a dedicated check queue (see queue.ts).
+export function monitorIsSearch(monitor: MonitorRow): boolean {
+  return (monitor.targets ?? []).some(target => target.type === "search");
+}
 
 export async function enqueueMonitorCheck(params: {
   monitorId: string;
   checkId: string;
   teamId: string;
+  search?: boolean;
 }): Promise<void> {
-  await addMonitorCheckJob(params);
+  await addMonitorCheckJob(
+    {
+      monitorId: params.monitorId,
+      checkId: params.checkId,
+      teamId: params.teamId,
+    },
+    { search: params.search },
+  );
 }
 
 export async function enqueueDueMonitorChecks(
@@ -43,6 +59,8 @@ export async function enqueueDueMonitorChecks(
     let check: Awaited<ReturnType<typeof createMonitorCheck>> | null = null;
     let dispatched = false;
     try {
+      if (await deferForJitter(monitor)) continue;
+
       if (monitor.current_check_id) {
         const cleared = await clearFinishedOrStaleCurrentCheck(monitor);
         if (cleared) {
@@ -89,6 +107,7 @@ export async function enqueueDueMonitorChecks(
         monitorId: monitor.id,
         checkId: check.id,
         teamId: monitor.team_id,
+        search: monitorIsSearch(monitor),
       });
       enqueued++;
     } catch (error) {
@@ -135,6 +154,28 @@ export async function enqueueDueMonitorChecks(
   return enqueued;
 }
 
+async function deferForJitter(monitor: MonitorRow): Promise<boolean> {
+  if (!monitor.next_run_at) return false;
+  const { intervalMs } = validateMonitorCron(
+    monitor.schedule_cron,
+    monitor.schedule_timezone,
+  );
+  const dueAt =
+    new Date(monitor.next_run_at).getTime() +
+    monitorJitterOffsetMs(monitor.id, intervalMs);
+  if (Date.now() >= dueAt) return false;
+  try {
+    await deferMonitorClaim(monitor.id, new Date(dueAt));
+  } catch (error) {
+    logger.warn("Failed to defer monitor claim for jitter", {
+      error,
+      monitorId: monitor.id,
+    });
+    return false;
+  }
+  return true;
+}
+
 async function clearFinishedOrStaleCurrentCheck(
   monitor: MonitorRow,
 ): Promise<boolean> {
@@ -148,7 +189,8 @@ async function clearFinishedOrStaleCurrentCheck(
   if (!current) return false;
 
   if (current.status === "running" || current.status === "queued") {
-    if (!isMonitorCheckStale(current)) return false;
+    if (!isMonitorCheckStale(current, new Date(), monitor.targets))
+      return false;
 
     if (current.autumn_lock_id) {
       await autumnService

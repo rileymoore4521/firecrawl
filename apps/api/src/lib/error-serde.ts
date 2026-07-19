@@ -35,9 +35,12 @@ import {
   VideoUnsupportedUrlError,
   XTwitterConfigurationError,
 } from "../scraper/scrapeURL/error";
+import { UnsafeDomainBlockedError } from "./threat-protection/error";
 
 // TODO: figure out correct typing for this
 const errorMap: Record<ErrorCodes, any> = {
+  // Terms responses are API-level, never transported through workers.
+  THIRD_PARTY_DATA_TERMS_REQUIRED: null,
   SCRAPE_TIMEOUT: ScrapeJobTimeoutError,
   MAP_TIMEOUT: MapTimeoutError,
   UNKNOWN_ERROR: UnknownError,
@@ -69,6 +72,7 @@ const errorMap: Record<ErrorCodes, any> = {
   SCRAPE_VIDEO_UNSUPPORTED_URL: VideoUnsupportedUrlError,
   SCRAPE_X_TWITTER_CONFIGURATION_ERROR: XTwitterConfigurationError,
   MAP_FAILED: MapFailedError,
+  unsafe_domain_blocked: UnsafeDomainBlockedError,
 
   // Zod errors
   BAD_REQUEST: null,

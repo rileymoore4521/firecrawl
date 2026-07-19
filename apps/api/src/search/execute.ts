@@ -13,8 +13,13 @@ import {
   mergeScrapedContent,
   calculateScrapeCredits,
 } from "./scrape";
+import { applyIndexedSearchHighlights, highlightsEnvReady } from "./highlights";
+import { runSearchHighlightsShadow } from "./highlights-shadow";
 import { trackSearchResults, trackSearchRequest } from "../lib/tracking";
 import type { BillingMetadata } from "../services/billing/types";
+import type { ThreatProtectionPolicy } from "../lib/threat-protection/types";
+import { checkUrlsAgainstThreatPolicy } from "../lib/threat-protection/request";
+import { calculateThreatScanCredits } from "../lib/scrape-billing";
 
 interface SearchOptions {
   query: string;
@@ -30,6 +35,7 @@ interface SearchOptions {
   excludeDomains?: string[];
   enterprise?: ("default" | "anon" | "zdr")[];
   scrapeOptions?: ScrapeOptions;
+  highlights?: boolean;
   timeout: number;
 }
 
@@ -45,6 +51,9 @@ interface SearchContext {
   zeroDataRetention?: boolean;
   billing?: BillingMetadata;
   agentIndexOnly?: boolean;
+  keylessReserved?: boolean;
+  /** Effective threat protection policy; blocked domains are removed from results entirely. */
+  threatProtectionPolicy?: ThreatProtectionPolicy | null;
 }
 
 interface SearchExecuteResult {
@@ -101,6 +110,46 @@ export async function executeSearch(
     enterprise: options.enterprise,
   })) as SearchV2Response;
 
+  // Threat protection: remove blocked results entirely — before
+  // slicing/counting, before scraping, and before returning. Checks are
+  // URL-level and deduped within this request; scan fees bill +2 per unique
+  // scanned URL (see calculateThreatScanCredits), charged as part of the
+  // search credits below.
+  let threatScanCredits = 0;
+  const threatPolicy = context.threatProtectionPolicy;
+  if (threatPolicy && threatPolicy.mode !== "off") {
+    const urlsToCheck = [
+      ...(searchResponse.web ?? []).map(x => x.url),
+      ...(searchResponse.news ?? []).map(x => x.url),
+      ...(searchResponse.images ?? []).map(x => x.url),
+    ].filter((x): x is string => !!x);
+
+    if (urlsToCheck.length > 0) {
+      const { decisionsByUrl } = await checkUrlsAgainstThreatPolicy(
+        urlsToCheck,
+        threatPolicy,
+        { teamId },
+      );
+      threatScanCredits = calculateThreatScanCredits(decisionsByUrl.values());
+      const isAllowed = (url: string | undefined | null): boolean => {
+        if (!url) return true;
+        const decision = decisionsByUrl.get(url);
+        return decision === undefined || decision.allowed;
+      };
+      if (searchResponse.web) {
+        searchResponse.web = searchResponse.web.filter(x => isAllowed(x.url));
+      }
+      if (searchResponse.news) {
+        searchResponse.news = searchResponse.news.filter(x => isAllowed(x.url));
+      }
+      if (searchResponse.images) {
+        searchResponse.images = searchResponse.images.filter(x =>
+          isAllowed(x.url),
+        );
+      }
+    }
+  }
+
   if (searchResponse.web && searchResponse.web.length > 0) {
     searchResponse.web = searchResponse.web.map(result => ({
       ...result,
@@ -142,15 +191,23 @@ export async function executeSearch(
 
   const isZDR = options.enterprise?.includes("zdr");
   const creditsPerTenResults = isZDR ? 10 : 2;
+  // Threat protection scan fees ride on the search credits: they are part of
+  // serving the search itself (every result domain is scanned before
+  // filtering), so they bill against the same feature and show up in the
+  // request's creditsUsed.
   const searchCredits =
-    Math.ceil(totalResultsCount / 10) * creditsPerTenResults;
+    Math.ceil(totalResultsCount / 10) * creditsPerTenResults +
+    threatScanCredits;
   let scrapeCredits = 0;
 
   const shouldScrape =
     scrapeOptions?.formats && scrapeOptions.formats.length > 0;
 
   if (shouldScrape && scrapeOptions) {
-    const itemsToScrape = getItemsToScrape(searchResponse, flags);
+    const itemsToScrape = getItemsToScrape(searchResponse, flags, {
+      team_id: teamId,
+      origin,
+    });
 
     if (itemsToScrape.length > 0) {
       const scrapeOpts = {
@@ -164,6 +221,8 @@ export async function executeSearch(
         requestId,
         billing,
         agentIndexOnly: context.agentIndexOnly,
+        keylessReserved: context.keylessReserved,
+        threatProtectionPolicy: threatPolicy ?? null,
       };
 
       const allDocsWithCostTracking = await scrapeSearchResults(
@@ -180,6 +239,34 @@ export async function executeSearch(
       );
       scrapeCredits = calculateScrapeCredits(allDocsWithCostTracking);
     }
+  }
+
+  // Experimental highlights beta: replace provider snippets with index-backed
+  // highlights. Gated on (1) the request opting in, (2) the team's highlightsBeta
+  // flag, and (3) all required envs being present (index DB, GCS, model). Any
+  // gate failing => silently keep the provider snippets.
+  // Runs after scraping (mergeScrapedContent rebuilds the result objects, so
+  // highlight mutations must come last to survive). Uses the user's original
+  // query, not the domain-filtered upstream query.
+  const shouldApplyHighlights =
+    options.highlights &&
+    flags?.highlightsBeta === true &&
+    highlightsEnvReady();
+  if (shouldApplyHighlights) {
+    await applyIndexedSearchHighlights(
+      searchResponse,
+      query,
+      logger,
+      context.requestId,
+    );
+  } else {
+    runSearchHighlightsShadow({
+      response: searchResponse,
+      query,
+      requestId: context.requestId,
+      teamId,
+      zeroDataRetention: zeroDataRetention === true || isZDR === true,
+    });
   }
 
   const scrapeFormats = scrapeOptions?.formats

@@ -19,6 +19,7 @@ import {
   addCrawlJobDone,
   crawlToCrawler,
   recordRobotsBlocked,
+  recordThreatBlocked,
   finishCrawlKickoff,
   generateURLPermutations,
   getCrawl,
@@ -29,12 +30,18 @@ import {
   setCrawlError,
   StoredCrawl,
 } from "../../lib/crawl-redis";
+import { checkUrlsAgainstThreatPolicy } from "../../lib/threat-protection/request";
+import type { ThreatDecision } from "../../lib/threat-protection/types";
 import { redisEvictConnection } from "../redis";
 import {
   resolveBillingMetadata,
   toAutumnBillingProperties,
+  type BillingMetadata,
 } from "../billing/types";
-import { autumnService } from "../autumn/autumn.service";
+import {
+  autumnService,
+  featureIdForBillingEndpoint,
+} from "../autumn/autumn.service";
 import {
   _addScrapeJobToBullMQ,
   addScrapeJob,
@@ -49,12 +56,17 @@ import { createWebhookSender, WebhookEvent } from "../webhook/index";
 import { CustomError } from "../../lib/custom-error";
 import { startWebScraperPipeline } from "../../main/runWebScraper";
 import { CostTracking } from "../../lib/cost-tracking";
+import { chargeKeylessCredits } from "../../lib/keyless";
 import { normalizeUrlOnlyHostname } from "../../lib/canonical-url";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
 import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
 import { generateURLSplits, queryIndexAtSplitLevel } from "../index";
 import { WebCrawler } from "../../scraper/WebScraper/crawler";
-import { calculateCreditsToBeBilled } from "../../lib/scrape-billing";
+import {
+  calculateCreditsToBeBilled,
+  calculateThreatScanCredits,
+} from "../../lib/scrape-billing";
+import { billTeam } from "../billing/credit_billing";
 import { getBillingQueue } from "../queue-service";
 import type { Logger } from "winston";
 import {
@@ -87,6 +99,11 @@ import {
   recordMonitorScrapeFailure,
   recordMonitorScrapeSuccess,
 } from "../monitoring/results";
+import {
+  reportExchangeBilling,
+  warmExchangeCatalog,
+  type ExchangeScrapeMetadata,
+} from "../../lib/exchange";
 
 configDotenv();
 
@@ -96,6 +113,7 @@ const jobLockExtensionTime = config.JOB_LOCK_EXTENSION_TIME;
 if (require.main === module) {
   cacheableLookup.install(http.globalAgent);
   cacheableLookup.install(https.globalAgent);
+  warmExchangeCatalog();
 }
 
 async function billScrapeJob(
@@ -106,6 +124,8 @@ async function billScrapeJob(
   flags: TeamFlags,
   error?: Error | null,
   unsupportedFeatures?: Set<FeatureFlag>,
+  exchange?: ExchangeScrapeMetadata,
+  threatDecisions?: ThreatDecision[],
 ) {
   let creditsToBeBilled: number | null = null;
   const billing = resolveBillingMetadata({
@@ -118,6 +138,10 @@ async function billScrapeJob(
     ...toAutumnBillingProperties(billing),
     apiKeyId: job.data.apiKeyId,
   };
+  // Scrapes initiated by a search (billing.endpoint === "search", e.g. search +
+  // scrapeOptions) are metered against SEARCH_CREDITS, matching the search
+  // request's own credits. Standalone scrapes stay on CREDITS.
+  const featureId = featureIdForBillingEndpoint(billing.endpoint);
   let trackedInRequest = false;
 
   if (job.data.is_scrape !== true && !job.data.internalOptions?.bypassBilling) {
@@ -129,7 +153,15 @@ async function billScrapeJob(
       flags,
       error,
       unsupportedFeatures,
+      exchange,
+      threatDecisions,
     );
+
+    // Charge the keyless free tier's per-IP daily credit budget unless this
+    // request reserved credits in the controller and will reconcile there.
+    if (!job.data.keylessReserved) {
+      await chargeKeylessCredits(job.data.team_id, creditsToBeBilled);
+    }
 
     if (
       job.data.team_id !== config.BACKGROUND_INDEX_TEAM_ID! &&
@@ -140,7 +172,7 @@ async function billScrapeJob(
           teamId: job.data.team_id,
           value: creditsToBeBilled,
           properties: autumnProperties,
-          requestScoped: true,
+          featureId,
         });
         const billingJobId = uuidv7();
         logger.debug(
@@ -153,12 +185,14 @@ async function billScrapeJob(
           },
         );
 
-        // Add directly to the billing queue - the billing worker will handle the rest
+        // Add directly to the billing queue - the billing worker will handle
+        // the rest, including confirming the Exchange access event once the
+        // debit actually commits. A failed commit leaves the event pending
+        // for reconciliation - it is never voided on an ambiguous outcome.
         await getBillingQueue().add(
           "bill_team",
           {
             team_id: job.data.team_id,
-            subscription_id: undefined,
             credits: creditsToBeBilled,
             billing,
             is_extract: false,
@@ -166,6 +200,9 @@ async function billScrapeJob(
             originating_job_id: job.id,
             api_key_id: job.data.apiKeyId,
             autumnTrackInRequest: trackedInRequest,
+            ...(exchange?.accessEventId === undefined
+              ? {}
+              : { exchangeAccessEventId: exchange.accessEventId }),
           },
           {
             jobId: billingJobId,
@@ -184,6 +221,19 @@ async function billScrapeJob(
             teamId: job.data.team_id,
             value: creditsToBeBilled,
             properties: autumnProperties,
+            featureId,
+          });
+        }
+        // The billing operation never reached the queue, so no debit will
+        // commit and no confirmation will ever arrive: void the Exchange
+        // access event instead of leaving it dangling. If the enqueue
+        // actually succeeded and only the acknowledgement was lost, the
+        // eventual confirmation repairs the void (void -> confirmed is
+        // legal on the Exchange). Fire-and-forget.
+        if (exchange?.accessEventId !== undefined) {
+          void reportExchangeBilling({
+            accessEventId: exchange.accessEventId,
+            status: "void",
           });
         }
         captureExceptionWithZdrCheck(error, {
@@ -195,6 +245,41 @@ async function billScrapeJob(
   }
 
   return creditsToBeBilled;
+}
+
+/**
+ * Bills threat protection scan fees for crawl-discovered URLs that were
+ * blocked by the policy and therefore never become scrape jobs. Only blocked
+ * decisions bill here: allowed discoveries are billed by their own scrape
+ * job, which performs its own scan. Only decisions that consulted the
+ * classifier carry a fee (+2 per unique scanned URL) — local-only blocks
+ * (e.g. blacklist) are free. Callers pass only FIRST-TIME blocks for this
+ * crawl (recordThreatBlocked's HSETNX return), so a blocked URL rediscovered
+ * by many page jobs bills once per crawl.
+ */
+function billThreatBlockedDiscoveries(
+  args: {
+    teamId: string;
+    apiKeyId: number | null;
+    billing: BillingMetadata;
+    bypassBilling: boolean;
+  },
+  blocked: { domain: string; decision: ThreatDecision }[],
+  logger: Logger,
+) {
+  if (args.bypassBilling) return;
+  const threatScanCredits = calculateThreatScanCredits(
+    blocked.map(x => x.decision),
+  );
+  if (threatScanCredits <= 0) return;
+  billTeam(args.teamId, threatScanCredits, args.apiKeyId, args.billing).catch(
+    error => {
+      logger.error(
+        `Failed to bill team ${args.teamId} for ${threatScanCredits} threat scan credit(s)`,
+        { error },
+      );
+    },
+  );
 }
 
 async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
@@ -226,6 +311,10 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
       : undefined;
   const signal = abortController.signal;
 
+  // Hoisted above the try so the catch path can read pipeline.threatDecisions
+  // for billing/logging even when the scrape failed.
+  let pipeline: ScrapeUrlResponse | null = null;
+
   try {
     if (remainingTime !== undefined && remainingTime < 0) {
       throw new ScrapeJobTimeoutError();
@@ -238,7 +327,6 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
       }
     }
 
-    let pipeline: ScrapeUrlResponse | null = null;
     let timeoutHandle: NodeJS.Timeout | null = null;
     try {
       pipeline = await Promise.race([
@@ -314,6 +402,21 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
       document: doc,
     };
 
+    // Ensure the parent `requests` row is committed before any child
+    // `scrapes`/`parses` insert, to avoid a request_id FK violation. Runs on
+    // both the crawl and single-scrape paths; only single scrapes actually
+    // carry a logRequestPromise.
+    if (job.data.logRequestPromise) {
+      const start = Date.now();
+      await job.data.logRequestPromise;
+      const waited = Date.now() - start;
+      if (waited > 0) {
+        logger.warn("Had to wait for log request promise to complete", {
+          timeMs: waited,
+        });
+      }
+    }
+
     if (job.data.crawl_id) {
       const sc = (await getCrawl(job.data.crawl_id)) as StoredCrawl;
 
@@ -365,6 +468,10 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
           isUrlBlocked(
             doc.metadata.url,
             (await getACUCTeam(job.data.team_id))?.flags ?? null,
+            {
+              team_id: job.data.team_id,
+              origin: job.data.origin,
+            },
           )
         ) {
           throw new CrawlDenialError(UNSUPPORTED_SITE_MESSAGE); // TODO: make this its own error type that is ignored by error tracking
@@ -421,7 +528,68 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
               }
             }
 
-            for (const link of links.links) {
+            // Threat protection: silently skip blocked discovered links
+            // (cross-domain links included) — the crawl continues. Skipped
+            // URLs + decisions are recorded for crawl bookkeeping. Checks
+            // are URL-level against the local hash-prefix lists (deduped
+            // in-batch), so many links stay cheap on the check side; blocked
+            // discoveries bill +2 per unique scanned URL.
+            let discoveredLinks = links.links;
+            const threatPolicy = job.data.internalOptions?.threatProtection;
+            if (
+              threatPolicy &&
+              threatPolicy.mode !== "off" &&
+              discoveredLinks.length > 0
+            ) {
+              const { allowedUrls, blocked } =
+                await checkUrlsAgainstThreatPolicy(
+                  discoveredLinks,
+                  threatPolicy,
+                  { teamId: job.data.team_id },
+                );
+              discoveredLinks = allowedUrls;
+              const newlyBlocked: typeof blocked = [];
+              for (const blockedUrl of blocked) {
+                if (
+                  await recordThreatBlocked(
+                    job.data.crawl_id,
+                    // Key on the canonical URL so raw spelling variants of
+                    // one URL dedupe to a single fee, matching billing.
+                    blockedUrl.decision.url ?? blockedUrl.url,
+                    blockedUrl.decision,
+                  )
+                ) {
+                  newlyBlocked.push(blockedUrl);
+                }
+              }
+              if (blocked.length > 0) {
+                billThreatBlockedDiscoveries(
+                  {
+                    teamId: job.data.team_id,
+                    apiKeyId: job.data.apiKeyId ?? null,
+                    billing: resolveBillingMetadata({
+                      billing: job.data.billing,
+                      crawlId: job.data.crawl_id,
+                      crawlerOptions: job.data.crawlerOptions,
+                    }),
+                    bypassBilling:
+                      job.data.internalOptions?.bypassBilling ?? false,
+                  },
+                  newlyBlocked,
+                  logger,
+                );
+                logger.info(
+                  "Skipped " +
+                    blocked.length +
+                    " discovered link(s) blocked by threat protection",
+                  {
+                    blockedDomains: [...new Set(blocked.map(x => x.domain))],
+                  },
+                );
+              }
+            }
+
+            for (const link of discoveredLinks) {
               if (await lockURL(job.data.crawl_id, sc, link)) {
                 // This seems to work really welel
                 const jobPriority = await getJobPriority({
@@ -492,6 +660,9 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
               [doc.metadata.url ?? doc.metadata.sourceURL!],
               1,
               sc.crawlerOptions?.maxDepth ?? 10,
+              false,
+              false,
+              true,
             );
             if (filterResult.links.length === 0) {
               const url = doc.metadata.url ?? doc.metadata.sourceURL!;
@@ -518,6 +689,8 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
         (await getACUCTeam(job.data.team_id))?.flags ?? null,
         undefined,
         pipeline.unsupportedFeatures,
+        pipeline.exchange,
+        pipeline.threatDecisions,
       );
 
       doc.metadata.creditsUsed = credits_billed ?? undefined;
@@ -535,6 +708,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
           options: job.data.scrapeOptions,
           cost_tracking: costTracking.toJSON(),
           pdf_num_pages: doc.metadata.numPages,
+          content_type: doc.metadata.contentType,
           credits_cost: credits_billed ?? 0,
           zeroDataRetention: job.data.zeroDataRetention,
           skipNuq: job.data.skipNuq ?? false,
@@ -607,6 +781,8 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
         (await getACUCTeam(job.data.team_id))?.flags ?? null,
         undefined,
         pipeline.unsupportedFeatures,
+        pipeline.exchange,
+        pipeline.threatDecisions,
       );
 
       doc.metadata.creditsUsed = credits_billed ?? undefined;
@@ -623,6 +799,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
           options: job.data.scrapeOptions,
           cost_tracking: costTracking.toJSON(),
           pdf_num_pages: doc.metadata.numPages,
+          content_type: doc.metadata.contentType,
           credits_cost: credits_billed ?? 0,
           zeroDataRetention: job.data.zeroDataRetention,
           skipNuq: job.data.skipNuq ?? false,
@@ -737,6 +914,23 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
             : new Error(JSON.stringify(error)),
     };
 
+    try {
+      // Ensure the parent `requests` row is committed before any child
+      // `scrapes`/`parses` insert, to avoid a request_id FK violation. Runs on
+      // both the crawl and single-scrape paths; only single scrapes actually
+      // carry a logRequestPromise.
+      if (job.data.logRequestPromise) {
+        const start = Date.now();
+        await job.data.logRequestPromise;
+        const waited = Date.now() - start;
+        if (waited > 0) {
+          logger.warn("Had to wait for log request promise to complete", {
+            timeMs: waited,
+          });
+        }
+      }
+    } catch {}
+
     if (job.data.crawl_id) {
       const sender = await createWebhookSender({
         teamId: job.data.team_id,
@@ -787,7 +981,24 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
       costTracking,
       (await getACUCTeam(job.data.team_id))?.flags ?? null,
       error instanceof Error ? error : null,
+      undefined,
+      undefined,
+      pipeline?.threatDecisions,
     );
+
+    // The Exchange delivered this access but the scrape ultimately failed,
+    // so the customer was never billed for it - void the access event so
+    // the Exchange ledger reconciles. Fire-and-forget. If billing was in
+    // fact queued before a later step failed, the billing worker's
+    // confirmation authoritatively repairs this void (void -> confirmed is
+    // legal on the Exchange; confirmed -> void is not), so a paid access
+    // can never end up voided.
+    if (pipeline?.success && pipeline.exchange?.accessEventId !== undefined) {
+      void reportExchangeBilling({
+        accessEventId: pipeline.exchange.accessEventId,
+        status: "void",
+      });
+    }
 
     logger.debug("Logging job to DB...");
     await logScrape(
@@ -1027,7 +1238,53 @@ async function processKickoffJob(job: NuQJob<ScrapeJobKickoff>) {
       }
     }
 
-    const indexLinks = await kickoffGetIndexLinks(sc, crawler, job.data.url);
+    let indexLinks = await kickoffGetIndexLinks(sc, crawler, job.data.url);
+
+    // Threat protection: skip blocked index-sourced discoveries (URL-level
+    // checks; first-time blocks are recorded and billed, see below).
+    const kickoffThreatPolicy = sc.internalOptions?.threatProtection;
+    if (
+      kickoffThreatPolicy &&
+      kickoffThreatPolicy.mode !== "off" &&
+      indexLinks.length > 0
+    ) {
+      const { allowedUrls, blocked } = await checkUrlsAgainstThreatPolicy(
+        indexLinks,
+        kickoffThreatPolicy,
+        { teamId: job.data.team_id },
+      );
+      indexLinks = allowedUrls;
+      const newlyBlocked: typeof blocked = [];
+      for (const blockedUrl of blocked) {
+        if (
+          await recordThreatBlocked(
+            job.data.crawl_id,
+            // Key on the canonical URL so raw spelling variants of one URL
+            // dedupe to a single fee, matching billing.
+            blockedUrl.decision.url ?? blockedUrl.url,
+            blockedUrl.decision,
+          )
+        ) {
+          newlyBlocked.push(blockedUrl);
+        }
+      }
+      if (blocked.length > 0) {
+        billThreatBlockedDiscoveries(
+          {
+            teamId: job.data.team_id,
+            apiKeyId: job.data.apiKeyId ?? null,
+            billing: resolveBillingMetadata({
+              billing: job.data.billing,
+              crawlId: job.data.crawl_id,
+              crawlerOptions: sc.crawlerOptions,
+            }),
+            bypassBilling: sc.internalOptions?.bypassBilling ?? false,
+          },
+          newlyBlocked,
+          logger,
+        );
+      }
+    }
 
     if (indexLinks.length > 0) {
       logger.debug("Using index links of length " + indexLinks.length, {
@@ -1140,7 +1397,7 @@ async function processKickoffSitemapJob(job: NuQJob<ScrapeJobKickoffSitemap>) {
       isPreCrawl: sc.internalOptions?.isPreCrawl ?? false,
     });
 
-    const passingURLs = (
+    let passingURLs = (
       await crawler.filterLinks(
         results.urls.map(x => x.href),
         Infinity,
@@ -1148,6 +1405,53 @@ async function processKickoffSitemapJob(job: NuQJob<ScrapeJobKickoffSitemap>) {
         false,
       )
     ).links;
+
+    // Threat protection: skip blocked sitemap entries — the crawl continues;
+    // skipped URLs + decisions are recorded as crawl bookkeeping (which also
+    // dedups the scan fee per crawl).
+    const sitemapThreatPolicy = sc.internalOptions?.threatProtection;
+    if (
+      sitemapThreatPolicy &&
+      sitemapThreatPolicy.mode !== "off" &&
+      passingURLs.length > 0
+    ) {
+      const { allowedUrls, blocked } = await checkUrlsAgainstThreatPolicy(
+        passingURLs,
+        sitemapThreatPolicy,
+        { teamId: job.data.team_id },
+      );
+      passingURLs = allowedUrls;
+      const newlyBlocked: typeof blocked = [];
+      for (const blockedUrl of blocked) {
+        if (
+          await recordThreatBlocked(
+            job.data.crawl_id,
+            // Key on the canonical URL so raw spelling variants of one URL
+            // dedupe to a single fee, matching billing.
+            blockedUrl.decision.url ?? blockedUrl.url,
+            blockedUrl.decision,
+          )
+        ) {
+          newlyBlocked.push(blockedUrl);
+        }
+      }
+      if (blocked.length > 0) {
+        billThreatBlockedDiscoveries(
+          {
+            teamId: job.data.team_id,
+            apiKeyId: job.data.apiKeyId ?? null,
+            billing: resolveBillingMetadata({
+              billing: job.data.billing,
+              crawlId: job.data.crawl_id,
+              crawlerOptions: sc.crawlerOptions,
+            }),
+            bypassBilling: sc.internalOptions?.bypassBilling ?? false,
+          },
+          newlyBlocked,
+          logger,
+        );
+      }
+    }
 
     if (passingURLs.length > 0) {
       logger.debug("Using urls of length " + passingURLs.length, {
@@ -1260,10 +1564,14 @@ export const processJobInternal = async (job: NuQJob<ScrapeJobData>) => {
 };
 
 async function processJobWithTracing(job: NuQJob<ScrapeJobData>, logger: any) {
+  // FDB-backed jobs hold their concurrency slot through the queue lease; the
+  // Redis slot mirror and promotion-on-done below are PG-backend machinery
+  const isFdbJob = (job as any).backend === "fdb";
   try {
     try {
       let extendLockInterval: NodeJS.Timeout | null = null;
       if (
+        !isFdbJob &&
         job.data?.mode !== "kickoff" &&
         job.data?.team_id &&
         !job.data.skipNuq
@@ -1333,7 +1641,7 @@ async function processJobWithTracing(job: NuQJob<ScrapeJobData>, logger: any) {
         }
       }
     } finally {
-      if (!job.data.skipNuq) {
+      if (!job.data.skipNuq && !isFdbJob) {
         await concurrentJobDone(job);
       }
     }

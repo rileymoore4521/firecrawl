@@ -32,10 +32,15 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
 
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
       - name: Install pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
         with:
-          version: 10
+          version: 11.4.0
 
       - name: Scan default branch audit failures
         id: scan
@@ -114,6 +119,20 @@ jobs:
           NODE
 
           gh pr edit "$PR_NUMBER" --body-file "$UPDATED_BODY_FILE"
+
+      - name: Request code review
+        if: ${{ steps.scan.outputs.has_uncovered == 'true' && steps.claude.outputs.branch_name != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: ${{ steps.claude.outputs.branch_name }}
+        run: |
+          set -euo pipefail
+          PR_NUMBER="$(gh pr list --head "$BRANCH_NAME" --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::warning::No open PR for ${BRANCH_NAME}; cannot request reviewers."
+            exit 0
+          fi
+          gh pr edit "$PR_NUMBER" --add-reviewer abimaelmartell,mogery
 
       - name: Notify Slack about remediation PR
         if: ${{ steps.remediation_pr.outputs.pr_url != '' && env.NPM_AUDIT_CLAUDE_SLACK_WEBHOOK_URL != '' }}

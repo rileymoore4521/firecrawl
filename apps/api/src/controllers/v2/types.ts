@@ -26,6 +26,9 @@ import {
   createWebhookSchema,
 } from "../../services/webhook/schema";
 import { BrandingProfile } from "../../types/branding";
+import { ProductProfile } from "../../types/product";
+import { MenuProfile } from "../../types/menu";
+import { threatProtectionOverrideSchema } from "../../lib/threat-protection/config";
 
 // Base URL schema with common validation logic
 export const URL = z.preprocess(
@@ -350,6 +353,25 @@ const jsonFormatWithOptions = z.strictObject({
 
 export type JsonFormatWithOptions = z.output<typeof jsonFormatWithOptions>;
 
+// "Deterministic JSON" — same shape as json mode, but extraction is performed by
+// reusable-json-mode (a cached, reusable JS extractor run in the code-sandbox)
+// rather than a per-request LLM call. Populates document.json like json mode.
+const deterministicJsonFormatWithOptions = z.strictObject({
+  type: z.literal("deterministicJson"),
+  schema: z
+    .any()
+    .optional()
+    .transform(val => normalizeSchemaForOpenAI(val))
+    .refine(val => validateSchemaForOpenAI(val), {
+      message: OPENAI_SCHEMA_ERROR_MESSAGE,
+    }),
+  prompt: z.string().max(10000).optional(),
+});
+
+type DeterministicJsonFormatWithOptions = z.output<
+  typeof deterministicJsonFormatWithOptions
+>;
+
 const changeTrackingFormatWithOptions = z.strictObject({
   type: z.literal("changeTracking"),
   prompt: z.string().optional(),
@@ -431,6 +453,7 @@ export type FormatObject =
   | { type: "images" }
   | { type: "summary" }
   | JsonFormatWithOptions
+  | DeterministicJsonFormatWithOptions
   | ChangeTrackingFormatWithOptions
   | ScreenshotFormatWithOptions
   | AttributesFormatWithOptions
@@ -438,6 +461,8 @@ export type FormatObject =
   | HighlightsFormatWithOptions
   | QueryFormatWithOptions
   | { type: "branding" }
+  | { type: "product" }
+  | { type: "menu" }
   | { type: "audio" }
   | { type: "video" };
 
@@ -538,6 +563,51 @@ const locationSchema = z
   })
   .optional();
 
+// Unified entity taxonomy exposed to callers. Maps to fire-privacy's
+// internal span kinds (PRIVATE_PERSON / EMAIL_ADDRESS / ACCOUNT_NUMBER /
+// etc.) inside the fire-privacy client. Names chosen to match the public
+// surface; if a caller asks for "EMAIL" they get email-shaped spans
+// regardless of which recognizer found them.
+const REDACT_PII_ENTITIES = [
+  "PERSON",
+  "EMAIL",
+  "PHONE",
+  "LOCATION",
+  "FINANCIAL",
+  "SECRET",
+] as const;
+const redactPIIEntitySchema = z.enum(REDACT_PII_ENTITIES);
+export type RedactPIIEntity = z.infer<typeof redactPIIEntitySchema>;
+
+// Public mode names. Mapped to fire-privacy internal modes
+// (model / both / heuristics) inside the client; the internal "precise"
+// mode is intentionally not exposed.
+//
+// - accurate (default): model only. Best precision (0.87), F1 (0.73).
+//   Cleanest redacted output.
+// - aggressive: model + Presidio + spaCy. Higher recall (0.73) at the
+//   cost of precision (0.68). Compliance use cases.
+// - fast: Presidio only, no model call. ~2x throughput, lower F1.
+const redactPIIOptionsSchema = z.strictObject({
+  mode: z.enum(["accurate", "aggressive", "fast"]).default("accurate"),
+  entities: z.array(redactPIIEntitySchema).optional(),
+  replaceStyle: z.enum(["tag", "mask", "remove"]).default("tag"),
+});
+export type RedactPIIOptions = z.infer<typeof redactPIIOptionsSchema>;
+
+// Boolean is the common case. Object form is for callers who want to
+// tune. After parse: `true` normalizes to defaults; `false` / unset
+// → `undefined`. Downstream code only has to check truthiness.
+const redactPIISchema = z
+  .union([z.boolean(), redactPIIOptionsSchema])
+  .optional()
+  .transform(v => {
+    if (v === undefined || v === false) return undefined;
+    if (v === true) return redactPIIOptionsSchema.parse({});
+    return v;
+  });
+// inferred shape: RedactPIIOptions | undefined after the transform
+
 const baseScrapeOptions = z.strictObject({
   formats: z
     .preprocess(
@@ -559,10 +629,13 @@ const baseScrapeOptions = z.strictObject({
           z.strictObject({ type: z.literal("images") }),
           z.strictObject({ type: z.literal("summary") }),
           jsonFormatWithOptions,
+          deterministicJsonFormatWithOptions,
           changeTrackingFormatWithOptions,
           screenshotFormatWithOptions,
           attributesFormatWithOptions,
           z.strictObject({ type: z.literal("branding") }),
+          z.strictObject({ type: z.literal("product") }),
+          z.strictObject({ type: z.literal("menu") }),
           questionFormatWithOptions,
           highlightsFormatWithOptions,
           queryFormatWithOptions,
@@ -580,7 +653,14 @@ const baseScrapeOptions = z.strictObject({
       const hasChangeTracking = x.find(f => f.type === "changeTracking");
       const hasMarkdown = x.find(f => f.type === "markdown");
       return !hasChangeTracking || hasMarkdown;
-    }, "The changeTracking format requires the markdown format to be specified as well"),
+    }, "The changeTracking format requires the markdown format to be specified as well")
+    .refine(x => {
+      // Both json and deterministicJson populate the `json` field, so one would
+      // just clobber the other. Require choosing one.
+      const hasJson = x.some(f => f.type === "json");
+      const hasDeterministicJson = x.some(f => f.type === "deterministicJson");
+      return !(hasJson && hasDeterministicJson);
+    }, "Cannot specify both json and deterministicJson formats"),
   headers: z.record(z.string(), z.string()).optional(),
   includeTags: z
     .string()
@@ -612,6 +692,10 @@ const baseScrapeOptions = z.strictObject({
   minAge: z.int().gte(0).optional(),
   storeInCache: z.boolean().prefault(true),
   lockdown: z.boolean().prefault(false),
+  redactPII: redactPIISchema,
+  // Enterprise: per-request field-level override of the org's threat
+  // protection policy. Gated on the team flag + org config (checkPermissions).
+  threatProtection: threatProtectionOverrideSchema.optional(),
 
   profile: z
     .object({
@@ -644,6 +728,18 @@ const waitForRefineOpts = {
   path: ["waitFor"],
 };
 
+export const applyScrapeOptionsDefaults = <T extends ScrapeOptionsBase>(
+  obj: T,
+): T & { skipTlsVerification: boolean } => ({
+  ...obj,
+  skipTlsVerification:
+    obj.skipTlsVerification ??
+    ((obj.headers && Object.keys(obj.headers).length > 0) ||
+    (obj.actions && obj.actions.length > 0)
+      ? false
+      : true),
+});
+
 // Base transform function that handles both nullable and non-nullable cases
 // Uses generic type to preserve all fields from extended schemas
 const extractTransformImpl = <T extends ScrapeOptionsBase | undefined>(
@@ -651,7 +747,7 @@ const extractTransformImpl = <T extends ScrapeOptionsBase | undefined>(
 ): T extends undefined ? undefined : T => {
   if (!obj) return obj as T extends undefined ? undefined : T;
   // Handle timeout
-  let result = { ...obj };
+  let result = applyScrapeOptionsDefaults(obj);
   if (
     obj.formats.find(x => typeof x === "object" && x.type === "json") &&
     obj.timeout === 30000
@@ -788,6 +884,7 @@ const extractOptions = z
     __experimental_showCostTracking: z.boolean().prefault(false),
     ignoreInvalidURLs: z.boolean().prefault(true),
     webhook: webhookSchema.optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
   })
   .refine(obj => obj.urls || obj.prompt, {
     error: "Either 'urls' or 'prompt' must be provided.",
@@ -848,6 +945,7 @@ export const agentRequestSchema = z.strictObject({
 
   overrideWhitelist: z.string().optional(),
   model: z.enum(["spark-1-pro", "spark-1-mini"]).default("spark-1-pro"),
+  threatProtection: threatProtectionOverrideSchema.optional(),
 });
 
 export type AgentRequest = z.infer<typeof agentRequestSchema>;
@@ -1019,7 +1117,14 @@ export const crawlerOptions = z.strictObject({
   deduplicateSimilarURLs: z.boolean().prefault(true),
   ignoreQueryParameters: z.boolean().prefault(false),
   regexOnFullURL: z.boolean().prefault(false),
-  delay: z.number().positive().optional(),
+  delay: z
+    .number()
+    .positive()
+    .max(
+      60,
+      "The delay parameter is measured in seconds and cannot exceed 60 seconds.",
+    )
+    .optional(),
 });
 
 // export type CrawlerOptions = {
@@ -1092,6 +1197,7 @@ const mapRequestSchemaBase = crawlerOptions
     ignoreCache: z.boolean().prefault(false),
     location: locationSchema,
     headers: z.record(z.string(), z.string()).optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
   });
 
 export const mapRequestSchema = strictWithMessage(mapRequestSchemaBase);
@@ -1116,12 +1222,15 @@ export type Document = {
   screenshot?: string;
   audio?: string;
   video?: string;
+  videos?: VideoItem[];
   extract?: any;
   json?: any;
   summary?: string;
   answer?: string;
   highlights?: string;
   branding?: BrandingProfile;
+  product?: ProductProfile;
+  menu?: MenuProfile;
   warning?: string;
   attributes?: {
     selector: string;
@@ -1200,6 +1309,7 @@ export type Document = {
     scrapeId?: string;
     error?: string;
     numPages?: number;
+    totalPages?: number;
     contentType?: string;
     timezone?: string;
     proxyUsed: "basic" | "stealth";
@@ -1217,6 +1327,22 @@ export type Document = {
     description: string;
     url: string;
   };
+};
+
+export type VideoItem = {
+  url: string;
+  sourceURL: string;
+  source: string;
+  kind?: string;
+  provider?: string;
+  title?: string;
+  thumbnail?: string;
+  description?: string;
+  duration?: string;
+  mimeType?: string;
+  width?: number;
+  height?: number;
+  metadata?: Record<string, unknown>;
 };
 
 export type ErrorResponse = {
@@ -1259,6 +1385,7 @@ export interface URLTrace {
 
 export interface ExtractResponse {
   success: boolean;
+  code?: ErrorCodes;
   error?: string;
   data?: any;
   scrape_id?: string;
@@ -1326,6 +1453,7 @@ export type MapResponse =
   | ErrorResponse
   | {
       success: true;
+      id: string;
       links?: MapDocument[];
       warning?: string;
     };
@@ -1355,6 +1483,9 @@ export type CrawlStatusResponse =
       total: number;
       creditsUsed: number;
       expiresAt: string;
+      createdAt?: string;
+      completedAt?: string;
+      duration?: number;
       next?: string;
       data: Document[];
       warning?: string;
@@ -1367,6 +1498,9 @@ export type CrawlStatusResponse =
       total: number;
       creditsUsed: number;
       expiresAt: string;
+      createdAt?: string;
+      completedAt?: string;
+      duration?: number;
       data: Document[];
     };
 
@@ -1408,18 +1542,40 @@ type Account = {
 export type TeamFlags = {
   ignoreRobots?: "disabled" | "allowed" | "forced";
   customRobotsAgent?: "disabled" | "allowed";
+  threatProtection?: "disabled" | "allowed" | "forced";
   unblockedDomains?: string[];
   forceZDR?: boolean;
   allowZDR?: boolean;
   scrapeZDR?: "disabled" | "allowed" | "forced";
-  searchZDR?: "disabled" | "allowed" | "forced";
+  searchZDR?: "disabled" | "allowed" | "forced" | "forced-zdr" | "forced-anon";
   zdrCost?: number;
   checkRobotsOnScrape?: boolean;
   crawlTtlHours?: number;
   ipWhitelist?: boolean;
+  // gates the per-team API key IP allowlist (ip_restriction_config table)
+  ipRestriction?: boolean;
+  // gates the per-key scope/format lockdown (key_restriction_config table)
+  keyRestriction?: boolean;
   bypassCreditChecks?: boolean;
   debugBranding?: boolean;
   maxBrowserSessions?: number;
+  researchBeta?: boolean;
+  highlightsBeta?: boolean;
+  menuBeta?: boolean;
+  enrichBeta?: boolean;
+  professionalProfileCompanyDataBeta?: boolean;
+  organizationDataSourceAccess?: Record<
+    string,
+    {
+      status?: "enabled" | "disabled" | "suspended" | string | null;
+      termsKey?: string | null;
+      termsVersion?: string | null;
+      termsAcceptedAt?: string | null;
+      enabledAt?: string | null;
+      disabledAt?: string | null;
+      disabledReason?: string | null;
+    }
+  >;
 } | null;
 
 interface RequestWithMaybeACUC<
@@ -1666,6 +1822,10 @@ export function fromV1ScrapeOptions(
             return { type: "screenshot" as const, fullPage: true };
           } else if (x === "branding") {
             return { type: "branding" as const };
+          } else if (x === "product") {
+            return { type: "product" as const };
+          } else if (x === "menu") {
+            return { type: "menu" as const };
           } else {
             return x;
           }
@@ -1800,7 +1960,12 @@ export const searchRequestSchema = z
     timeout: z.int().positive().finite().prefault(60000),
     ignoreInvalidURLs: z.boolean().optional().prefault(false),
     asyncScraping: z.boolean().optional().prefault(false),
+    // Experimental: replace each result's snippet with query-relevant
+    // highlights pulled from our index (last 30 days), out-of-line from
+    // scrapeURL. Falls back to the provider snippet when the URL isn't indexed.
+    highlights: z.boolean().optional().prefault(false),
     __searchPreviewToken: z.string().optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
     scrapeOptions: baseScrapeOptions
       .extend({
         formats: z
@@ -1822,6 +1987,8 @@ export const searchRequestSchema = z
                 z.strictObject({ type: z.literal("links") }),
                 z.strictObject({ type: z.literal("images") }),
                 z.strictObject({ type: z.literal("summary") }),
+                z.strictObject({ type: z.literal("product") }),
+                z.strictObject({ type: z.literal("menu") }),
                 jsonFormatWithOptions,
                 questionFormatWithOptions,
                 highlightsFormatWithOptions,
@@ -1988,6 +2155,29 @@ const missingContentEntrySchema = z.strictObject({
   description: z.string().trim().max(2000).optional(),
 });
 
+function hasSubstantiveSearchFeedback(data: {
+  rating: "good" | "bad" | "partial";
+  valuableSources?: unknown[];
+  missingContent?: unknown[];
+  querySuggestions?: string;
+}): boolean {
+  const hasSources = (data.valuableSources?.length ?? 0) > 0;
+  const hasMissing = (data.missingContent?.length ?? 0) > 0;
+  const hasSuggestions =
+    !!data.querySuggestions && data.querySuggestions.length > 0;
+
+  switch (data.rating) {
+    case "good":
+      return hasSources;
+    case "partial":
+      return hasSources || hasMissing;
+    case "bad":
+      return hasMissing || hasSuggestions;
+  }
+
+  return false;
+}
+
 export const searchFeedbackSchema = z
   .strictObject({
     rating: z.enum(["good", "bad", "partial"]),
@@ -2005,27 +2195,10 @@ export const searchFeedbackSchema = z
     origin: z.string().optional().prefault("api"),
     integration: integrationSchema.optional().transform(val => val || null),
   })
-  .refine(
-    data => {
-      const hasSources = (data.valuableSources?.length ?? 0) > 0;
-      const hasMissing = (data.missingContent?.length ?? 0) > 0;
-      const hasSuggestions =
-        !!data.querySuggestions && data.querySuggestions.length > 0;
-
-      switch (data.rating) {
-        case "good":
-          return hasSources;
-        case "partial":
-          return hasSources || hasMissing;
-        case "bad":
-          return hasMissing || hasSuggestions;
-      }
-    },
-    {
-      message:
-        "Feedback must be substantive. 'good' requires at least one valuableSources entry; 'partial' requires valuableSources or at least one missingContent entry; 'bad' requires at least one missingContent entry or querySuggestions.",
-    },
-  );
+  .refine(data => hasSubstantiveSearchFeedback(data), {
+    message:
+      "Feedback must be substantive. 'good' requires at least one valuableSources entry; 'partial' requires valuableSources or at least one missingContent entry; 'bad' requires at least one missingContent entry or querySuggestions.",
+  });
 
 export type SearchFeedbackRequest = z.infer<typeof searchFeedbackSchema>;
 export type SearchFeedbackRequestInput = z.input<typeof searchFeedbackSchema>;
@@ -2042,6 +2215,119 @@ export type SearchFeedbackErrorCode =
 
 export type SearchFeedbackResponse =
   | (ErrorResponse & { feedbackErrorCode?: SearchFeedbackErrorCode })
+  | {
+      success: true;
+      feedbackId: string;
+      creditsRefunded: number;
+      alreadySubmitted?: boolean;
+      dailyCapReached?: boolean;
+      creditsRefundedToday?: number;
+      dailyRefundCap?: number;
+      warning?: string;
+    };
+
+// =============================================
+// Generic Endpoint Feedback
+// =============================================
+
+const endpointFeedbackEndpointSchema = z.enum([
+  "search",
+  "scrape",
+  "parse",
+  "map",
+]);
+
+export type EndpointFeedbackEndpoint = z.infer<
+  typeof endpointFeedbackEndpointSchema
+>;
+
+const feedbackIssueSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(80)
+  .regex(
+    /^[a-z0-9][a-z0-9_-]*$/,
+    "Issue codes must use lowercase letters, numbers, underscores, or hyphens",
+  );
+
+const MAX_FEEDBACK_METADATA_BYTES = 8 * 1024;
+const feedbackMetadataSchema = z
+  .record(z.string(), z.unknown())
+  .refine(
+    value =>
+      new TextEncoder().encode(JSON.stringify(value)).length <=
+      MAX_FEEDBACK_METADATA_BYTES,
+    "metadata must be 8KB or smaller",
+  );
+
+export const endpointFeedbackSchema = z
+  .strictObject({
+    endpoint: endpointFeedbackEndpointSchema,
+    jobId: z.uuid(),
+    rating: z.enum(["good", "bad", "partial"]),
+    issues: z.array(feedbackIssueSchema).max(20).optional(),
+    tags: z.array(feedbackIssueSchema).max(20).optional(),
+    note: z.string().trim().max(4000).optional(),
+    valuableSources: z
+      .array(
+        z.strictObject({
+          url: searchFeedbackUrlSchema,
+          reason: z.string().trim().max(1000).optional(),
+        }),
+      )
+      .max(50)
+      .optional(),
+    missingContent: z.array(missingContentEntrySchema).max(50).optional(),
+    querySuggestions: z.string().trim().max(2000).optional(),
+    url: searchFeedbackUrlSchema.optional(),
+    pageNumbers: z.array(z.number().int().positive()).max(100).optional(),
+    metadata: feedbackMetadataSchema.optional(),
+    origin: z.string().optional().prefault("api"),
+    integration: integrationSchema.optional().transform(val => val || null),
+  })
+  .refine(
+    data => {
+      return (
+        (data.issues?.length ?? 0) > 0 ||
+        (data.tags?.length ?? 0) > 0 ||
+        (data.note?.length ?? 0) > 0 ||
+        (data.valuableSources?.length ?? 0) > 0 ||
+        (data.missingContent?.length ?? 0) > 0 ||
+        !!data.querySuggestions ||
+        !!data.url ||
+        (data.pageNumbers?.length ?? 0) > 0
+      );
+    },
+    {
+      message:
+        "Feedback must include at least one substantive signal: issues, note, sources, missingContent, querySuggestions, url, or pageNumbers.",
+    },
+  )
+  .refine(
+    data => data.endpoint !== "search" || hasSubstantiveSearchFeedback(data),
+    {
+      message:
+        "Search feedback must be substantive. 'good' requires at least one valuableSources entry; 'partial' requires valuableSources or at least one missingContent entry; 'bad' requires at least one missingContent entry or querySuggestions.",
+    },
+  );
+
+export type EndpointFeedbackRequest = z.infer<typeof endpointFeedbackSchema>;
+export type EndpointFeedbackRequestInput = z.input<
+  typeof endpointFeedbackSchema
+>;
+
+export type EndpointFeedbackErrorCode =
+  | "JOB_NOT_FOUND"
+  | "FEEDBACK_WINDOW_EXPIRED"
+  | "PREVIEW_TEAM_NOT_ALLOWED"
+  | "TEAM_OPTED_OUT"
+  | "INVALID_BODY"
+  | "DB_DISABLED"
+  | "INTERNAL";
+
+export type EndpointFeedbackResponse =
+  | (ErrorResponse & { feedbackErrorCode?: EndpointFeedbackErrorCode })
   | {
       success: true;
       feedbackId: string;

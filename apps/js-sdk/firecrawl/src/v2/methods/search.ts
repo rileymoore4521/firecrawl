@@ -37,9 +37,13 @@ function prepareSearchPayload(req: SearchRequest): Record<string, unknown> {
   if (req.ignoreInvalidURLs != null)
     payload.ignoreInvalidURLs = req.ignoreInvalidURLs;
   if (req.timeout != null) payload.timeout = req.timeout;
+  if (req.highlights != null) payload.highlights = req.highlights;
   if (req.integration && req.integration.trim())
     payload.integration = req.integration.trim();
   if (req.origin) payload.origin = req.origin;
+  if (req.enterprise) payload.enterprise = req.enterprise;
+  if (req.threatProtection != null)
+    payload.threatProtection = req.threatProtection;
   if (req.scrapeOptions) {
     ensureValidScrapeOptions(req.scrapeOptions as ScrapeOptions);
     payload.scrapeOptions = req.scrapeOptions;
@@ -98,6 +102,20 @@ export async function search(
     if (data.news) out.news = transformArray<SearchResultNews>(data.news);
     if (data.images)
       out.images = transformArray<SearchResultImages>(data.images);
+    Object.defineProperty(out, "data", {
+      get() {
+        const parts: string[] = [];
+        if (out.web?.length) parts.push(`.web (${out.web.length} results)`);
+        if (out.news?.length) parts.push(`.news (${out.news.length} results)`);
+        if (out.images?.length) parts.push(`.images (${out.images.length} results)`);
+        const available = parts.length ? parts.join(", ") : ".web, .news, or .images";
+        throw new Error(
+          `SearchData has no '.data'. Results are grouped by source: ${available}`,
+        );
+      },
+      enumerable: false,
+      configurable: true,
+    });
     return out;
   } catch (err: any) {
     if (err?.isAxiosError) return normalizeAxiosError(err, "search");

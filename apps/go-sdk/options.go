@@ -90,6 +90,7 @@ type ScrapeOptions struct {
 	MaxAge              *int64                   `json:"maxAge,omitempty"`
 	StoreInCache        *bool                    `json:"storeInCache,omitempty"`
 	Lockdown            *bool                    `json:"lockdown,omitempty"`
+	RedactPII           *bool                    `json:"redactPII,omitempty"`
 	Integration         *string                  `json:"integration,omitempty"`
 	JsonOptions         *JsonOptions             `json:"jsonOptions,omitempty"`
 }
@@ -170,6 +171,7 @@ type SearchOptions struct {
 	Location          *string        `json:"location,omitempty"`
 	IgnoreInvalidURLs *bool          `json:"ignoreInvalidURLs,omitempty"`
 	Timeout           *int           `json:"timeout,omitempty"`
+	Highlights        *bool          `json:"highlights,omitempty"`
 	ScrapeOptions     *ScrapeOptions `json:"scrapeOptions,omitempty"`
 	Integration       *string        `json:"integration,omitempty"`
 }

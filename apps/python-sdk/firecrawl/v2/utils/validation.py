@@ -565,13 +565,35 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
         "use_mock": "useMock",
         "block_ads": "blockAds",
         "store_in_cache": "storeInCache",
-        "max_age": "maxAge"
+        "max_age": "maxAge",
+        "redact_pii": "redactPII",
+        "threat_protection": "threatProtection",
     }
     
     # Apply field mappings
     for snake_case, camel_case in field_mappings.items():
         if snake_case in options_data:
             scrape_data[camel_case] = options_data.pop(snake_case)
+
+    # redactPII may be a nested object whose inner `replace_style` field
+    # also needs camel-casing.
+    if isinstance(scrape_data.get("redactPII"), dict):
+        if "replace_style" in scrape_data["redactPII"]:
+            scrape_data["redactPII"]["replaceStyle"] = scrape_data["redactPII"].pop(
+                "replace_style"
+            )
+
+    # threatProtection is a nested object whose inner fields also need
+    # camel-casing.
+    if isinstance(scrape_data.get("threatProtection"), dict):
+        threat_data = scrape_data["threatProtection"]
+        for snake_case, camel_case in (
+            ("risk_score_threshold", "riskScoreThreshold"),
+            ("blocked_tlds", "blockedTlds"),
+            ("failure_policy", "failurePolicy"),
+        ):
+            if snake_case in threat_data:
+                threat_data[camel_case] = threat_data.pop(snake_case)
     
     # Handle special cases
     for key, value in options_data.items():
@@ -634,6 +656,10 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
                                     converted_formats.append(_validate_highlights_format(fmt.model_dump(exclude_none=True)))
                                 elif fmt.type == 'query':
                                     converted_formats.append(_validate_query_format(fmt.model_dump(exclude_none=True)))
+                                elif fmt.type in ('changeTracking', 'change_tracking'):
+                                    data = fmt.model_dump(exclude_none=True)
+                                    data['type'] = _convert_format_string(data.get('type', fmt.type))
+                                    converted_formats.append(data)
                                 else:
                                     converted_formats.append(_convert_format_string(fmt.type))
                             else:
@@ -711,6 +737,10 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
                                 converted_formats.append(normalized)
                             elif fmt.type == 'query':
                                 converted_formats.append(_validate_query_format(fmt.model_dump(exclude_none=True)))
+                            elif fmt.type in ('changeTracking', 'change_tracking'):
+                                data = fmt.model_dump(exclude_none=True)
+                                data['type'] = _convert_format_string(data.get('type', fmt.type))
+                                converted_formats.append(data)
                             else:
                                 converted_formats.append(_convert_format_string(fmt.type))
                         else:

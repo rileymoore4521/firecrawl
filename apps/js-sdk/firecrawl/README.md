@@ -7,7 +7,7 @@ The Firecrawl Node SDK is a library that lets you easily search, scrape, and int
 To install the Firecrawl Node SDK, you can use npm:
 
 ```bash
-npm install @mendable/firecrawl-js
+npm install firecrawl
 ```
 
 ## Usage
@@ -18,7 +18,7 @@ npm install @mendable/firecrawl-js
 Here's an example of how to use the SDK with error handling:
 
 ```js
-import Firecrawl from '@mendable/firecrawl-js';
+import { Firecrawl } from 'firecrawl';
 
 const app = new Firecrawl({ apiKey: 'fc-YOUR_API_KEY' });
 
@@ -56,6 +56,30 @@ const doc = await app.scrape('https://www.youtube.com/watch?v=dQw4w9WgXcQ', {
 });
 
 console.log(doc.video);
+```
+
+### Product extraction
+
+Use the `product` format to deterministically pull a product (title, price, availability, variants) from product pages — the deterministic counterpart to the LLM-based `json` format.
+
+```js
+const doc = await app.scrape('https://example.com/product/123', {
+  formats: ['product'],
+});
+
+console.log(doc.product);
+```
+
+### Menu extraction
+
+Use the `menu` format to deterministically pull a merchant's menu (sections, items, prices, availability) from menu pages — the deterministic counterpart to the LLM-based `json` format.
+
+```js
+const doc = await app.scrape('https://example.com/restaurant/menu', {
+  formats: ['menu'],
+});
+
+console.log(doc.menu);
 ```
 
 ### Parsing uploaded files
@@ -114,7 +138,7 @@ const status = await app.getCrawlStatus(id);
 Use `extract` with a prompt and schema. Zod schemas are supported directly.
 
 ```js
-import Firecrawl from '@mendable/firecrawl-js';
+import { Firecrawl } from 'firecrawl';
 import { z } from 'zod';
 
 const app = new Firecrawl({ apiKey: 'fc-YOUR_API_KEY' });
@@ -236,7 +260,7 @@ await watch.start();
 The feature‑frozen v1 is still available under `app.v1` with the original method names.
 
 ```js
-import Firecrawl from '@mendable/firecrawl-js';
+import { Firecrawl } from 'firecrawl';
 
 const app = new Firecrawl({ apiKey: 'fc-YOUR_API_KEY' });
 

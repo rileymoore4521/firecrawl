@@ -20,11 +20,11 @@ import { resolveBillingMetadata } from "../billing/types";
 import systemMonitor from "../system-monitor";
 import { v7 as uuidv7 } from "uuid";
 import {
-  index_supabase_service,
   processIndexInsertJobs,
   processOMCEJobs,
   queryDomainsForPrecrawl,
 } from "..";
+import { queryTopUrlsForDomain } from "../../db/rpc";
 import { getSearchIndexClient } from "../../lib/search-index-client";
 // Search indexing is now handled by the separate search service
 // import { processSearchIndexJobs } from "../../lib/search-index/queue";
@@ -38,9 +38,8 @@ import {
 import { StoredCrawl, crawlToCrawler, saveCrawl } from "../../lib/crawl-redis";
 import { _addScrapeJobToBullMQ } from "../queue-jobs";
 import { withSpan, setSpanAttributes } from "../../lib/otel-tracer";
-import { crawlGroup } from "../worker/nuq";
+import { crawlGroup, resolveNewGroupBackend } from "../worker/nuq-router";
 import { getACUCTeam } from "../../controllers/auth";
-import { supabase_service } from "../supabase";
 import { processEngpickerJob } from "../../lib/engpicker";
 import { logRequest } from "../logging/log_job";
 
@@ -83,15 +82,14 @@ const processBillingJobInternal = async (token: string, job: Job) => {
       // This is an individual billing operation that should be queued for batch processing
       const {
         team_id,
-        subscription_id,
         credits,
         billing,
         endpoint,
         is_extract,
         api_key_id,
         autumnTrackInRequest,
-      } =
-        job.data;
+        exchangeAccessEventId,
+      } = job.data;
 
       logger.info(`Adding team ${team_id} billing operation to batch queue`, {
         credits,
@@ -102,7 +100,6 @@ const processBillingJobInternal = async (token: string, job: Job) => {
       // Add to the REDIS batch queue
       await queueBillingOperation(
         team_id,
-        subscription_id,
         credits,
         api_key_id ?? null,
         resolveBillingMetadata({
@@ -111,6 +108,13 @@ const processBillingJobInternal = async (token: string, job: Job) => {
         }),
         is_extract,
         autumnTrackInRequest,
+        typeof exchangeAccessEventId === "string" &&
+          exchangeAccessEventId.length > 0
+          ? {
+              accessEventId: exchangeAccessEventId,
+              billingReference: String(job.id),
+            }
+          : undefined,
       );
     } else {
       logger.warn(`Unknown billing job type: ${job.name}`);
@@ -270,7 +274,7 @@ const processPrecrawlJob = async (token: string, job: Job) => {
 
       type DomainUrlResult = {
         url: string;
-        domain_hash: string;
+        domain_hash: Buffer;
         event_count: number;
         rank: number;
       };
@@ -284,13 +288,16 @@ const processPrecrawlJob = async (token: string, job: Job) => {
         const batch = batches[i];
 
         const batchFutures = batch.map(({ hash, urlsToFetch }) => {
-          return index_supabase_service
-            .rpc("query_top_urls_for_domain", {
-              p_domain_hash: hash,
-              p_time_window: "8 days", // increasing window can significantly slow down the query, modify with caution
-              p_top_n: urlsToFetch,
-            })
-            .overrideTypes<DomainUrlResult[]>();
+          return queryTopUrlsForDomain<DomainUrlResult>(
+            hash,
+            "8 days", // increasing window can significantly slow down the query, modify with caution
+            urlsToFetch,
+          )
+            .then(data => ({ data, error: null }))
+            .catch(error => ({
+              data: null as DomainUrlResult[] | null,
+              error,
+            }));
         });
 
         const startTimeNs = process.hrtime.bigint();
@@ -352,10 +359,11 @@ const processPrecrawlJob = async (token: string, job: Job) => {
 
       const bucketedByDomain: Map<string, DomainUrlResult[]> = new Map();
       for (const item of urls) {
-        if (!bucketedByDomain.has(item.domain_hash)) {
-          bucketedByDomain.set(item.domain_hash, []);
+        const key = item.domain_hash.toString("hex");
+        if (!bucketedByDomain.has(key)) {
+          bucketedByDomain.set(key, []);
         }
-        bucketedByDomain.get(item.domain_hash)!.push(item);
+        bucketedByDomain.get(key)!.push(item);
       }
 
       const crawlTargets: Map<
@@ -372,7 +380,9 @@ const processPrecrawlJob = async (token: string, job: Job) => {
 
       for (const domain of domains) {
         try {
-          const pages = bucketedByDomain.get(domain.domain_hash);
+          const pages = bucketedByDomain.get(
+            domain.domain_hash.toString("hex"),
+          );
 
           // if this doesn't have any pages, do we want to locate the domain itself and add root only?
           if (!pages || pages.length === 0) {
@@ -503,6 +513,7 @@ const processPrecrawlJob = async (token: string, job: Job) => {
               zeroDataRetention: false,
             };
 
+            sc.queueBackend = await resolveNewGroupBackend(sc.team_id);
             await crawlGroup.addGroup(
               crawlId,
               sc.team_id,
@@ -510,6 +521,11 @@ const processPrecrawlJob = async (token: string, job: Job) => {
                 60 *
                 60 *
                 1000,
+              {
+                backend: sc.queueBackend,
+                maxConcurrency: sc.maxConcurrency,
+                delaySeconds: sc.crawlerOptions?.delay,
+              },
             );
 
             await saveCrawl(crawlId, sc);
@@ -658,44 +674,6 @@ const workerFun = async (
   process.exit(0);
 };
 
-async function tallyBilling() {
-  const logger = _logger.child({
-    module: "index-worker",
-    method: "tallyBilling",
-  });
-  // get up to 100 teams and remove them from set
-  const billedTeams = await getRedisConnection().srandmember(
-    "billed_teams",
-    100,
-  );
-
-  if (!billedTeams || billedTeams.length === 0) {
-    logger.debug("No billed teams to process");
-    return;
-  }
-
-  await getRedisConnection().srem("billed_teams", billedTeams);
-  logger.info("Starting to update tallies", {
-    billedTeams: billedTeams.length,
-  });
-
-  for (const teamId of billedTeams) {
-    logger.info("Updating tally for team", { teamId });
-
-    const { error } = await supabase_service.rpc("update_tally_10_team", {
-      i_team_id: teamId,
-    });
-
-    if (error) {
-      logger.warn("Failed to update tally for team", { teamId, error });
-    } else {
-      logger.info("Updated tally for team", { teamId });
-    }
-  }
-
-  logger.info("Finished updating tallies");
-}
-
 const INDEX_INSERT_INTERVAL = 3000;
 const WEBHOOK_INSERT_INTERVAL = 15000;
 const OMCE_INSERT_INTERVAL = 5000;
@@ -759,16 +737,6 @@ const BROWSER_ACTIVITY_INSERT_INTERVAL = 10000;
     });
   }, OMCE_INSERT_INTERVAL);
 
-  const billingTallyInterval = setInterval(
-    async () => {
-      if (isShuttingDown) {
-        return;
-      }
-      await tallyBilling();
-    },
-    5 * 60 * 1000,
-  );
-
   const engpickerPromise = (async () => {
     if (config.DISABLE_ENGPICKER) {
       logger.info("Engpicker is disabled, skipping");
@@ -817,6 +785,5 @@ const BROWSER_ACTIVITY_INSERT_INTERVAL = 10000;
   clearInterval(webhookInserterInterval);
   clearInterval(browserActivityInterval);
   clearInterval(omceInserterInterval);
-  clearInterval(billingTallyInterval);
   logger.info("All workers shut down, exiting process");
 })();
